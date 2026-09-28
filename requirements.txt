@@ -3,4 +3,3 @@ openai
 PyMuPDF
 Pillow
 requests
-streamlit-image-coordinates
