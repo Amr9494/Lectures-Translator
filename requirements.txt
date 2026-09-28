@@ -1,8 +1,8 @@
-streamlit>=1.35.0
-openai>=1.30.0
-PyMuPDF>=1.24.0
-Pillow>=10.3.0
-pydantic>=2.7.0
-arabic-reshaper>=3.0.0
-python-bidi>=0.4.2
-requests>=2.31.0
+streamlit
+openai
+PyMuPDF
+Pillow
+opencv-python-headless
+numpy
+arabic-reshaper
+python-bidi

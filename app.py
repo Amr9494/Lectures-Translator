@@ -1,232 +1,909 @@
 import io
 import base64
-from typing import List, Tuple
+import json
+import os
+import re
+import tempfile
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
 
-import fitz  # PyMuPDF
-from PIL import Image
+import cv2
+import fitz
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 import streamlit as st
 from openai import OpenAI
 
+try:
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+    ARABIC_SUPPORT = True
+except ImportError:
+    ARABIC_SUPPORT = False
 
-# ==========================================
-# 1. Helper Functions: 16:9 & Image Processing
-# ==========================================
+
+# ============================================================
+# Configuration
+# ============================================================
+
+VISION_MODEL = "gpt-5.6-luna"
+IMAGE_MODEL = "gpt-image-2"
+
+
+# ============================================================
+# PDF / image helpers
+# ============================================================
+
 def extract_page_as_image(doc: fitz.Document, page_num: int, zoom: float = 2.0) -> Image.Image:
-    """Renders a PDF page to a high-resolution PIL Image."""
     page = doc.load_page(page_num)
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
-    img_data = pix.tobytes("png")
-    return Image.open(io.BytesIO(img_data)).convert("RGBA")
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    return Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
 
 
-def prepare_square_image(image: Image.Image, target_size: int = 1024) -> Tuple[bytes, Tuple[int, int, int, int]]:
-    """
-    DALL-E 2 strictly requires a square PNG under 4 MB.
-    This letterboxes 16:9 slides onto a 1024x1024 transparent canvas so that
-    no stretching or distortion occurs, and returns the crop coordinates.
-    """
-    orig_w, orig_h = image.size
-    scale = target_size / max(orig_w, orig_h)
-    new_w = int(orig_w * scale)
-    new_h = int(orig_h * scale)
+def pil_to_data_url(image: Image.Image, max_side: int = 2200) -> str:
+    img = image.copy()
+    if max(img.size) > max_side:
+        scale = max_side / max(img.size)
+        img = img.resize(
+            (max(1, int(img.width * scale)), max(1, int(img.height * scale))),
+            Image.Resampling.LANCZOS,
+        )
 
-    # Resize keeping aspect ratio
-    resized = image.resize((new_w, new_h), Image.Resampling.LANCZOS).convert("RGBA")
-
-    # Paste onto a square transparent canvas centered
-    square_canvas = Image.new("RGBA", (target_size, target_size), (0, 0, 0, 0))
-    offset_x = (target_size - new_w) // 2
-    offset_y = (target_size - new_h) // 2
-    square_canvas.paste(resized, (offset_x, offset_y))
-
-    byte_stream = io.BytesIO()
-    square_canvas.save(byte_stream, format="PNG")
-    byte_stream.seek(0)
-
-    # Return the bytes and the crop box to remove the padding later
-    crop_box = (offset_x, offset_y, offset_x + new_w, offset_y + new_h)
-    return byte_stream.getvalue(), crop_box
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=92, optimize=True)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-import requests
+def nearest_divisible(n: int, divisor: int = 16) -> int:
+    return max(divisor, round(n / divisor) * divisor)
 
-def translate_page_with_image_model(
+
+def prepare_for_image_edit(image: Image.Image) -> Image.Image:
+    """Resize only enough to satisfy GPT Image arbitrary-resolution constraints."""
+    w, h = image.size
+    nw = nearest_divisible(w)
+    nh = nearest_divisible(h)
+    if nw == w and nh == h:
+        return image.copy()
+    return image.resize((nw, nh), Image.Resampling.LANCZOS)
+
+
+# ============================================================
+# Structured vision analysis
+# ============================================================
+
+TEXT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "regions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "original": {"type": "string"},
+                    "translation": {"type": "string"},
+                    # Normalized coordinates, 0..1000:
+                    # [x1, y1, x2, y2]
+                    "bbox": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "minItems": 4,
+                        "maxItems": 4,
+                    },
+                    "role": {
+                        "type": "string",
+                        "enum": [
+                            "title", "heading", "body", "label", "caption",
+                            "table", "diagram_text", "speech_bubble", "other"
+                        ],
+                    },
+                    "align": {
+                        "type": "string",
+                        "enum": ["left", "center", "right"],
+                    },
+                    "color": {"type": "string"},
+                    "confidence": {"type": "number"},
+                    "keep_original": {"type": "boolean"},
+                },
+                "required": [
+                    "original", "translation", "bbox", "role", "align",
+                    "color", "confidence", "keep_original"
+                ],
+            },
+        }
+    },
+    "required": ["regions"],
+}
+
+
+def normalize_hex_color(value: str, fallback: str = "#111111") -> str:
+    if not isinstance(value, str):
+        return fallback
+
+    value = value.strip()
+
+    if re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+        return value
+
+    if re.fullmatch(r"#[0-9a-fA-F]{3}", value):
+        return "#" + "".join(c * 2 for c in value[1:])
+
+    return fallback
+
+
+def analyze_and_translate_page(
     client: OpenAI,
     image: Image.Image,
     source_lang: str,
     target_lang: str,
-    glossary: str = ""
-) -> Image.Image:
-    """
-    Pads 16:9 slide to square, translates via OpenAI Image Edit API,
-    crops back to 16:9, and scales to original resolution.
-    """
-    # 1. Letterbox to square PNG for the API
-    square_bytes, crop_box = prepare_square_image(image, target_size=1024)
+    glossary: str,
+    min_confidence: float,
+) -> List[Dict[str, Any]]:
+    data_url = pil_to_data_url(image)
+    glossary_text = glossary.strip() if glossary.strip() else "(none)"
 
-    # Prompt crafted for image-edit models (kept compact to comply with DALL-E's character limit)
     prompt = f"""
-For the slide artwork in the center of the image:
-1. Detect all human-readable text.
-2. Translate the text from {source_lang} to {target_lang}.
-3. Keep the original illustration, background, speech bubbles, and layout completely intact.
-4. Replace only the original text, blending seamlessly with the style and lighting.
-5. Render clean, properly connected typography for {target_lang}.
+You are a precision document-layout OCR and translation engine.
+
+Analyze the supplied lecture slide image. The goal is to translate ONLY human-readable
+natural-language text while preserving the original artwork, illustrations, diagrams,
+photographs, equations, symbols, numbers, logos, and layout.
+
+Source language: {source_lang}
+Target language: {target_lang}
+
+Return every distinct text region that should be translated.
+
+IMPORTANT:
+- Coordinates MUST be normalized integers from 0 to 1000:
+  [x1,y1,x2,y2], where 0,0 is the top-left and 1000,1000 is the bottom-right.
+- Make boxes tight around the visible text, not around surrounding artwork.
+- Do not combine unrelated text regions.
+- Do not include decorative marks that are not text.
+- Do not translate equations, mathematical variables, units, numerical values,
+  or programming/code unless they contain natural-language words.
+- If text is already in the target language, set translation equal to original.
+- Preserve proper names unless they are normally translated.
+- Preserve terminology consistently.
+- For text embedded in a diagram, translate the words but do not alter the diagram.
+- For a speech bubble/sign, return only the text inside it.
+- If a region is too uncertain to safely modify, set keep_original=true.
+- Estimate the original text color as a hex RGB value.
+- Confidence is 0 to 1.
+- Never invent text that is not visible.
+
+Glossary:
+{glossary_text}
+
+Return ONLY the requested structured data.
 """
-    if glossary.strip():
-        prompt += f"\nGlossary: {glossary.strip()}"
 
-    prompt = prompt[:990].strip()
-
-    # 2. Call OpenAI DALL-E 2 Image Edit (without response_format)
-    response = client.images.edit(
-        model="dall-e-2",
-        image=("page.png", square_bytes, "image/png"),
-        prompt=prompt,
-        n=1,
-        size="1024x1024"
+    response = client.responses.create(
+        model=VISION_MODEL,
+        input=[{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": prompt},
+                {"type": "input_image", "image_url": data_url, "detail": "high"},
+            ],
+        }],
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "slide_translation_regions",
+                "schema": TEXT_SCHEMA,
+                "strict": True,
+            }
+        },
+        max_output_tokens=12000,
     )
 
-    # 3. Retrieve the generated image from URL or b64 fallback
-    image_item = response.data[0]
-    if hasattr(image_item, "url") and image_item.url:
-        img_response = requests.get(image_item.url, timeout=30)
-        img_response.raise_for_status()
-        result_square = Image.open(io.BytesIO(img_response.content)).convert("RGB")
-    elif hasattr(image_item, "b64_json") and image_item.b64_json:
-        decoded_bytes = base64.b64decode(image_item.b64_json)
-        result_square = Image.open(io.BytesIO(decoded_bytes)).convert("RGB")
-    else:
-        raise ValueError("No valid image data or URL returned by OpenAI.")
+    payload = json.loads(response.output_text)
+    regions = []
 
-    # 4. Crop out the letterbox padding to retrieve pure 16:9
-    result_16_9 = result_square.crop(crop_box)
+    w, h = image.size
 
-    # 5. Upscale back to the user's original dimensions
-    return result_16_9.resize(image.size, Image.Resampling.LANCZOS)
+    for item in payload.get("regions", []):
+        bx = item["bbox"]
+
+        if len(bx) != 4:
+            continue
+
+        # Convert normalized 0..1000 coordinates to actual image pixels.
+        x1 = int(round(max(0, min(1000, bx[0])) * w / 1000))
+        y1 = int(round(max(0, min(1000, bx[1])) * h / 1000))
+        x2 = int(round(max(0, min(1000, bx[2])) * w / 1000))
+        y2 = int(round(max(0, min(1000, bx[3])) * h / 1000))
+
+        x1 = max(0, min(w - 1, x1))
+        y1 = max(0, min(h - 1, y1))
+        x2 = max(x1 + 1, min(w, x2))
+        y2 = max(y1 + 1, min(h, y2))
+
+        item["bbox"] = [x1, y1, x2, y2]
+        item["color"] = normalize_hex_color(item.get("color", "#111111"))
+        item["confidence"] = float(item.get("confidence", 0.0))
+
+        regions.append(item)
+
+    return [r for r in regions if r["confidence"] >= min_confidence]
+
+
+# ============================================================
+# Font handling / rendering
+# ============================================================
+
+def find_default_font(target_lang: str) -> str | None:
+    lang = target_lang.lower()
+    candidates = []
+
+    if "arab" in lang:
+        candidates += [
+            "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansArabic-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]
+
+    if any(x in lang for x in ["chinese", "japanese", "korean"]):
+        candidates += [
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttf",
+        ]
+
+    candidates += [
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    ]
+
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+
+    return None
+
+
+def shape_text(text: str, target_lang: str) -> str:
+    if "arab" in target_lang.lower():
+        if not ARABIC_SUPPORT:
+            return text
+        return get_display(arabic_reshaper.reshape(text))
+    return text
+
+
+def hex_to_rgb(value: str) -> Tuple[int, int, int]:
+    value = normalize_hex_color(value)
+    return tuple(int(value[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def wrap_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    max_width: int,
+) -> List[str]:
+    words = text.split()
+
+    if not words:
+        return [""]
+
+    lines = []
+    current = ""
+
+    for word in words:
+        candidate = word if not current else current + " " + word
+        bb = draw.textbbox((0, 0), candidate, font=font)
+
+        if bb[2] - bb[0] <= max_width:
+            current = candidate
+        else:
+            if current:
+                lines.append(current)
+            current = word
+
+    if current:
+        lines.append(current)
+
+    return lines
+
+
+def fit_font(
+    text: str,
+    bbox: Tuple[int, int, int, int],
+    font_path: str,
+    target_lang: str,
+    min_size: int = 8,
+) -> Tuple[ImageFont.FreeTypeFont, List[str]]:
+    x1, y1, x2, y2 = bbox
+    box_w = max(8, x2 - x1)
+    box_h = max(8, y2 - y1)
+
+    shaped = shape_text(text, target_lang)
+
+    # Use the original box height as the main starting point, then reduce
+    # until both width and total line height fit.
+    start = max(min_size, int(box_h * 0.82))
+
+    dummy = Image.new("RGB", (10, 10))
+    draw = ImageDraw.Draw(dummy)
+
+    for size in range(start, min_size - 1, -1):
+        font = ImageFont.truetype(font_path, size=size)
+        lines = wrap_text(draw, shaped, font, int(box_w * 0.96))
+
+        line_height = max(1, int(size * 1.15))
+        total_h = len(lines) * line_height
+
+        if total_h <= box_h * 0.94:
+            return font, lines
+
+    font = ImageFont.truetype(font_path, size=min_size)
+    return font, wrap_text(draw, shaped, font, int(box_w * 0.96))
+
+
+# ============================================================
+# Background removal / text rendering
+# ============================================================
+
+def make_inpaint_mask(
+    image_size: Tuple[int, int],
+    regions: List[Dict[str, Any]],
+    padding: int = 2,
+) -> np.ndarray:
+    w, h = image_size
+    mask = np.zeros((h, w), dtype=np.uint8)
+
+    for region in regions:
+        if region.get("keep_original"):
+            continue
+
+        if not region.get("translation", "").strip():
+            continue
+
+        x1, y1, x2, y2 = region["bbox"]
+
+        x1 = max(0, x1 - padding)
+        y1 = max(0, y1 - padding)
+        x2 = min(w, x2 + padding)
+        y2 = min(h, y2 + padding)
+
+        cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
+
+    # Slight expansion catches antialiased text edges without making a huge mask.
+    kernel = np.ones((3, 3), np.uint8)
+    return cv2.dilate(mask, kernel, iterations=1)
+
+
+def inpaint_text_regions(
+    image: Image.Image,
+    regions: List[Dict[str, Any]],
+    radius: int = 3,
+) -> Image.Image:
+    if not regions:
+        return image.copy()
+
+    arr = np.array(image.convert("RGB"))
+    mask = make_inpaint_mask(image.size, regions, padding=2)
+
+    restored = cv2.inpaint(
+        arr,
+        mask,
+        radius,
+        cv2.INPAINT_TELEA,
+    )
+
+    return Image.fromarray(restored)
+
+
+def render_translated_regions(
+    base_image: Image.Image,
+    regions: List[Dict[str, Any]],
+    font_path: str,
+    target_lang: str,
+) -> Image.Image:
+    image = base_image.copy().convert("RGB")
+    draw = ImageDraw.Draw(image)
+
+    for region in regions:
+        if region.get("keep_original"):
+            continue
+
+        text = region.get("translation", "").strip()
+
+        if not text:
+            continue
+
+        x1, y1, x2, y2 = region["bbox"]
+
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        try:
+            font, lines = fit_font(
+                text,
+                (x1, y1, x2, y2),
+                font_path,
+                target_lang,
+            )
+        except Exception:
+            continue
+
+        color = hex_to_rgb(region.get("color", "#111111"))
+        align = region.get("align", "left")
+
+        line_height = max(1, int(font.size * 1.15))
+        total_h = line_height * len(lines)
+
+        y = y1 + max(
+            0,
+            ((y2 - y1) - total_h) // 2,
+        )
+
+        for line in lines:
+            bb = draw.textbbox((0, 0), line, font=font)
+            tw = bb[2] - bb[0]
+
+            if align == "center":
+                x = x1 + ((x2 - x1) - tw) // 2
+            elif align == "right":
+                x = x2 - tw
+            else:
+                x = x1
+
+            draw.text(
+                (x, y),
+                line,
+                font=font,
+                fill=color,
+            )
+
+            y += line_height
+
+    return image
+
+
+# ============================================================
+# Optional GPT Image fallback
+# ============================================================
+
+def ai_masked_edit(
+    client: OpenAI,
+    image: Image.Image,
+    regions: List[Dict[str, Any]],
+    target_lang: str,
+) -> Image.Image:
+    """
+    Use GPT Image only for difficult pages.
+
+    The mask limits the requested edit to detected text regions.
+    This is deliberately OFF by default because it costs image-generation
+    API usage and is less deterministic than local reconstruction.
+    """
+    editable = [
+        r for r in regions
+        if not r.get("keep_original") and r.get("translation", "").strip()
+    ]
+
+    if not editable:
+        return image.copy()
+
+    work = prepare_for_image_edit(image)
+    w, h = work.size
+
+    # GPT Image masks use transparent pixels to mark areas to edit.
+    mask = Image.new("RGBA", (w, h), (0, 0, 0, 255))
+    mask_draw = ImageDraw.Draw(mask)
+
+    sx = w / image.width
+    sy = h / image.height
+
+    for region in editable:
+        x1, y1, x2, y2 = region["bbox"]
+
+        mask_draw.rectangle(
+            (
+                int(x1 * sx),
+                int(y1 * sy),
+                int(x2 * sx),
+                int(y2 * sy),
+            ),
+            fill=(0, 0, 0, 0),
+        )
+
+    image_buf = io.BytesIO()
+    work.convert("RGB").save(image_buf, format="PNG")
+    image_buf.seek(0)
+
+    mask_buf = io.BytesIO()
+    mask.save(mask_buf, format="PNG")
+    mask_buf.seek(0)
+
+    mapping = "\n".join(
+        f'- Replace "{r["original"]}" with "{r["translation"]}".'
+        for r in editable
+    )
+
+    prompt = f"""
+Edit ONLY the masked text regions of this lecture slide.
+
+Target language: {target_lang}
+
+{mapping}
+
+Rules:
+- Do not change unmasked artwork.
+- Do not redraw diagrams, photographs, people, borders, icons, equations,
+  or backgrounds.
+- Do not add decorations.
+- Preserve the exact positions and approximate typography of the existing text.
+- Replace the specified text with the specified translations.
+- Make translated text correctly shaped and legible.
+- Do not translate anything that is not in the supplied mapping.
+"""
+
+    response = client.images.edit(
+        model=IMAGE_MODEL,
+        image=("page.png", image_buf.getvalue(), "image/png"),
+        mask=("mask.png", mask_buf.getvalue(), "image/png"),
+        prompt=prompt[:32000],
+        n=1,
+        size=f"{w}x{h}",
+        output_format="png",
+        quality="medium",
+    )
+
+    item = response.data[0]
+
+    if not getattr(item, "b64_json", None):
+        raise RuntimeError("GPT Image returned no base64 image data.")
+
+    result = Image.open(
+        io.BytesIO(base64.b64decode(item.b64_json))
+    ).convert("RGB")
+
+    return result.resize(
+        image.size,
+        Image.Resampling.LANCZOS,
+    )
+
+
+# ============================================================
+# PDF output
+# ============================================================
 
 def compile_images_to_pdf(images: List[Image.Image]) -> bytes:
-    """Combines a list of PIL Images into a single downloadable PDF file in memory."""
     if not images:
         return b""
-    pdf_buffer = io.BytesIO()
-    rgb_images = [img.convert("RGB") for img in images]
+
+    buf = io.BytesIO()
+    rgb_images = [image.convert("RGB") for image in images]
+
     rgb_images[0].save(
-        pdf_buffer,
+        buf,
         format="PDF",
         save_all=True,
         append_images=rgb_images[1:],
-        resolution=150.0
+        resolution=150.0,
     )
-    return pdf_buffer.getvalue()
+
+    return buf.getvalue()
 
 
-# ==========================================
-# 2. Streamlit User Interface
-# ==========================================
+# ============================================================
+# Streamlit UI
+# ============================================================
+
 st.set_page_config(
-    page_title="Lecture & Slide Translator",
+    page_title="Lecture Translator",
     page_icon="📚",
-    layout="wide"
+    layout="wide",
 )
 
-# Sidebar: Authentication & Configuration
+st.title("📚 Lecture Translator")
+
+st.caption(
+    "Translate lecture pages while preserving the original artwork and layout. "
+    "The app first detects text and then edits only those regions."
+)
+
 with st.sidebar:
-    st.title("⚙️ Settings")
-    st.markdown("### 🔑 OpenAI API Key")
-    user_api_key = st.text_input(
-        "Enter your OpenAI Key (`sk-...`)",
+    st.header("⚙️ Settings")
+
+    api_key = st.text_input(
+        "OpenAI API key",
         type="password",
-        help="Your key stays only in browser session memory and is never logged or stored."
+        help=(
+            "Used for this Streamlit session. Do not put API keys in source code "
+            "or commit them to GitHub."
+        ),
     )
 
-    st.info("💡 **16:9 Slide Support**: Automatically pads slides to square, translates, and crops out borders.")
+    source_lang = st.selectbox(
+        "Source language",
+        [
+            "English",
+            "Arabic",
+            "Finnish",
+            "German",
+            "French",
+            "Spanish",
+            "Auto-detect",
+        ],
+    )
 
-    st.divider()
-    st.markdown("### 📖 Translation Rules")
-    source_lang = st.selectbox("Source Language", ["English", "Arabic", "Finnish", "German", "French", "Spanish", "Auto-detect"], index=0)
-    target_lang = st.selectbox("Target Language", ["Arabic", "Finnish", "English", "German", "Spanish", "Swedish"], index=0)
+    target_lang = st.selectbox(
+        "Target language",
+        [
+            "Arabic",
+            "Finnish",
+            "English",
+            "German",
+            "Spanish",
+            "Swedish",
+        ],
+    )
 
-    with st.expander("Custom Glossary (Optional)"):
-        glossary_input = st.text_area(
-            "Format: term = translation",
-            placeholder="Taqwa = تقوى\nmagnetic flux density = magneettivuon tiheys",
-            height=120
+    glossary = st.text_area(
+        "Glossary (optional)",
+        placeholder=(
+            "magnetic flux density = magneettivuon tiheys\n"
+            "Taqwa = تقوى"
+        ),
+        height=120,
+    )
+
+    confidence = st.slider(
+        "Minimum OCR confidence",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.65,
+        step=0.05,
+    )
+
+    use_ai_fallback = st.checkbox(
+        "Use GPT Image fallback for difficult pages",
+        value=False,
+        help=(
+            "Costs additional image-generation API usage. "
+            "Keep this OFF while testing the deterministic pipeline."
+        ),
+    )
+
+    font_upload = st.file_uploader(
+        "Optional target-language font (.ttf/.otf)",
+        type=["ttf", "otf"],
+        help=(
+            "Recommended for Arabic, Persian, Urdu, CJK, or any language "
+            "where the system font may not contain all required glyphs."
+        ),
+    )
+
+    if not ARABIC_SUPPORT:
+        st.warning(
+            "Arabic shaping packages are not installed. "
+            "Add arabic-reshaper and python-bidi to requirements.txt "
+            "if Arabic is a target language."
         )
 
-# Main Application Area
-st.title("📚 Lecture & Slide Translator")
-st.caption("Translate lecture slides and illustrated materials page-by-page while maintaining artwork, characters, and background layouts intact.")
+uploaded = st.file_uploader(
+    "Upload lecture PDF",
+    type=["pdf"],
+)
 
-uploaded_file = st.file_uploader("Upload Lecture Slide / Document PDF", type=["pdf"])
-
-if uploaded_file is not None:
-    pdf_bytes = uploaded_file.read()
+if uploaded is not None:
+    pdf_bytes = uploaded.read()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     total_pages = len(doc)
-    st.success(f"Loaded `{uploaded_file.name}` ({total_pages} total pages)")
 
-    # Page range selector
-    col_range1, col_range2 = st.columns(2)
-    with col_range1:
-        start_page = st.number_input("Start Page", min_value=1, max_value=total_pages, value=1)
-    with col_range2:
-        end_page = st.number_input("End Page", min_value=start_page, max_value=total_pages, value=min(start_page, total_pages))
+    st.success(
+        f"Loaded **{uploaded.name}** — {total_pages} pages."
+    )
 
-    if st.button("🚀 Start Translation", type="primary"):
-        if not user_api_key:
-            st.error("Please enter your OpenAI API key in the sidebar to proceed.")
+    col1, col2 = st.columns(2)
+
+    with col1:
+        start_page = st.number_input(
+            "Start page",
+            min_value=1,
+            max_value=total_pages,
+            value=1,
+            step=1,
+        )
+
+    with col2:
+        end_page = st.number_input(
+            "End page",
+            min_value=int(start_page),
+            max_value=total_pages,
+            value=min(total_pages, int(start_page) + 2),
+            step=1,
+        )
+
+    st.info(
+        "Recommended: test 1–3 pages first. "
+        "Only process the whole lecture after the preview looks correct."
+    )
+
+    if font_upload:
+        suffix = Path(font_upload.name).suffix
+        temp_font = tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=suffix,
+        )
+        temp_font.write(font_upload.getvalue())
+        temp_font.close()
+        font_path = temp_font.name
+    else:
+        font_path = find_default_font(target_lang)
+
+    if not font_path:
+        st.error(
+            "No usable font was found. Upload a .ttf/.otf font "
+            "for the target language."
+        )
+        st.stop()
+
+    st.caption(f"Rendering font: `{font_path}`")
+
+    if st.button(
+        "🚀 Analyze & Translate",
+        type="primary",
+    ):
+        if not api_key.strip():
+            st.error(
+                "Enter your OpenAI API key first."
+            )
             st.stop()
 
-        openai_client = OpenAI(api_key=user_api_key)
-        translated_images = []
-        progress_bar = st.progress(0.0)
-        status_text = st.empty()
+        client = OpenAI(
+            api_key=api_key.strip()
+        )
 
-        pages_to_process = list(range(start_page - 1, end_page))
-        total_to_process = len(pages_to_process)
+        pages = list(
+            range(
+                int(start_page) - 1,
+                int(end_page),
+            )
+        )
 
-        for idx, page_num in enumerate(pages_to_process):
-            status_text.markdown(f"**Translating page {page_num + 1} of {total_pages}...**")
-            
-            # 1. Extract original page
-            orig_img = extract_page_as_image(doc, page_num, zoom=2.0)
+        translated_images: List[Image.Image] = []
+        all_regions: Dict[int, List[Dict[str, Any]]] = {}
 
-            # 2. Translate directly using OpenAI's Image Model
+        progress = st.progress(0.0)
+        status = st.empty()
+
+        for index, page_num in enumerate(pages):
+            status.info(
+                f"Analyzing page {page_num + 1} / {total_pages}"
+            )
+
+            original = extract_page_as_image(
+                doc,
+                page_num,
+                zoom=2.0,
+            )
+
             try:
-                trans_img = translate_page_with_image_model(
-                    client=openai_client,
-                    image=orig_img,
+                regions = analyze_and_translate_page(
+                    client=client,
+                    image=original,
                     source_lang=source_lang,
                     target_lang=target_lang,
-                    glossary=glossary_input
+                    glossary=glossary,
+                    min_confidence=confidence,
                 )
-                translated_images.append(trans_img)
 
-            except Exception as e:
-                st.warning(f"Error on page {page_num + 1}: {str(e)}. Keeping original page image.")
-                translated_images.append(orig_img.convert("RGB"))
+                all_regions[page_num] = regions
 
-            progress_bar.progress((idx + 1) / total_to_process)
+                if not regions:
+                    translated = original.copy()
+                else:
+                    # Primary method: deterministic reconstruction.
+                    cleaned = inpaint_text_regions(
+                        original,
+                        regions,
+                    )
 
-        status_text.success("🎉 Translation Complete!")
+                    translated = render_translated_regions(
+                        cleaned,
+                        regions,
+                        font_path,
+                        target_lang,
+                    )
 
-        # Visual Comparison Preview
-        st.subheader("Slide Comparison Preview")
-        preview_col1, preview_col2 = st.columns(2)
-        with preview_col1:
-            st.markdown("**Original Page**")
-            st.image(extract_page_as_image(doc, pages_to_process[0], zoom=1.5), use_container_width=True)
-        with preview_col2:
-            st.markdown("**Translated Result**")
-            st.image(translated_images[0], use_container_width=True)
+                    # Optional generative fallback.
+                    if use_ai_fallback:
+                        try:
+                            translated = ai_masked_edit(
+                                client,
+                                original,
+                                regions,
+                                target_lang,
+                            )
+                        except Exception as fallback_error:
+                            st.warning(
+                                f"GPT Image fallback failed on page "
+                                f"{page_num + 1}. Keeping deterministic "
+                                f"rendering. {fallback_error}"
+                            )
 
-        # PDF Download Button
-        pdf_out = compile_images_to_pdf(translated_images)
+                translated_images.append(
+                    translated
+                )
+
+            except Exception as error:
+                st.error(
+                    f"Page {page_num + 1} failed: {error}"
+                )
+
+                # Never discard the page.
+                translated_images.append(
+                    original.copy()
+                )
+
+            progress.progress(
+                (index + 1) / len(pages)
+            )
+
+        status.success(
+            "🎉 Translation finished."
+        )
+
+        if translated_images:
+            st.subheader(
+                "Preview — first processed page"
+            )
+
+            preview_left, preview_right = st.columns(2)
+
+            with preview_left:
+                st.markdown("**Original**")
+                st.image(
+                    extract_page_as_image(
+                        doc,
+                        pages[0],
+                        zoom=1.5,
+                    ),
+                    use_container_width=True,
+                )
+
+            with preview_right:
+                st.markdown("**Translated**")
+                st.image(
+                    translated_images[0],
+                    use_container_width=True,
+                )
+
+        with st.expander(
+            "Detected text regions"
+        ):
+            for page_num, regions in all_regions.items():
+                st.markdown(
+                    f"### Page {page_num + 1}"
+                )
+
+                for region in regions:
+                    st.write(
+                        {
+                            "original": region["original"],
+                            "translation": region["translation"],
+                            "bbox": region["bbox"],
+                            "confidence": region["confidence"],
+                            "keep_original": region["keep_original"],
+                        }
+                    )
+
+        output_pdf = compile_images_to_pdf(
+            translated_images
+        )
+
         st.download_button(
-            label="📥 Download Translated PDF",
-            data=pdf_out,
-            file_name=f"translated_{uploaded_file.name}",
-            mime="application/pdf"
+            "📥 Download translated PDF",
+            data=output_pdf,
+            file_name=(
+                f"translated_{Path(uploaded.name).stem}.pdf"
+            ),
+            mime="application/pdf",
         )
