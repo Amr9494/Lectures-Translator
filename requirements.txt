@@ -2,7 +2,4 @@ streamlit
 openai
 PyMuPDF
 Pillow
-opencv-python-headless
-numpy
-arabic-reshaper
-python-bidi
+requests
