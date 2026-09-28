@@ -1,6 +1,6 @@
 import io
 import base64
-from typing import List
+from typing import List, Tuple
 
 import fitz  # PyMuPDF
 from PIL import Image
@@ -9,7 +9,7 @@ from openai import OpenAI
 
 
 # ==========================================
-# 1. Helper Functions: Image & PDF Processing
+# 1. Helper Functions: 16:9 & Image Processing
 # ==========================================
 def extract_page_as_image(doc: fitz.Document, page_num: int, zoom: float = 2.0) -> Image.Image:
     """Renders a PDF page to a high-resolution PIL Image."""
@@ -20,13 +20,33 @@ def extract_page_as_image(doc: fitz.Document, page_num: int, zoom: float = 2.0) 
     return Image.open(io.BytesIO(img_data)).convert("RGBA")
 
 
-def image_to_png_bytes(image: Image.Image) -> bytes:
-    """Converts a PIL Image to raw PNG bytes for the OpenAI API."""
+def prepare_square_image(image: Image.Image, target_size: int = 1024) -> Tuple[bytes, Tuple[int, int, int, int]]:
+    """
+    DALL-E 2 strictly requires a square PNG under 4 MB.
+    This letterboxes 16:9 slides onto a 1024x1024 transparent canvas so that
+    no stretching or distortion occurs, and returns the crop coordinates.
+    """
+    orig_w, orig_h = image.size
+    scale = target_size / max(orig_w, orig_h)
+    new_w = int(orig_w * scale)
+    new_h = int(orig_h * scale)
+
+    # Resize keeping aspect ratio
+    resized = image.resize((new_w, new_h), Image.Resampling.LANCZOS).convert("RGBA")
+
+    # Paste onto a square transparent canvas centered
+    square_canvas = Image.new("RGBA", (target_size, target_size), (0, 0, 0, 0))
+    offset_x = (target_size - new_w) // 2
+    offset_y = (target_size - new_h) // 2
+    square_canvas.paste(resized, (offset_x, offset_y))
+
     byte_stream = io.BytesIO()
-    # The image-edit endpoint requires RGBA/PNG format
-    image.convert("RGBA").save(byte_stream, format="PNG")
+    square_canvas.save(byte_stream, format="PNG")
     byte_stream.seek(0)
-    return byte_stream.getvalue()
+
+    # Return the bytes and the crop box to remove the padding later
+    crop_box = (offset_x, offset_y, offset_x + new_w, offset_y + new_h)
+    return byte_stream.getvalue(), crop_box
 
 
 def translate_page_with_image_model(
@@ -37,32 +57,30 @@ def translate_page_with_image_model(
     glossary: str = ""
 ) -> Image.Image:
     """
-    Calls OpenAI's image-editing engine directly with the user's master prompt.
-    This eliminates flat bounding box patches and font glyph failures (tofu boxes).
+    Pads 16:9 slide to square, translates via OpenAI Image Edit API,
+    crops back to 16:9, and scales to original resolution.
     """
-    raw_png = image_to_png_bytes(image)
+    # 1. Letterbox to square PNG for the API
+    square_bytes, crop_box = prepare_square_image(image, target_size=1024)
 
-    # Master prompt matching the exact instructions
+    # Prompt crafted for image-edit models (kept compact to comply with DALL-E's 1000 char limit)
     prompt = f"""
-For this page image:
+For the slide artwork in the center of the image:
 1. Detect all human-readable text.
 2. Translate the text from {source_lang} to {target_lang}.
-3. Preserve the original page dimensions, resolution, exact layout, and positions of all elements.
-4. Do not redraw, redesign, or reinterpret diagrams, illustrations, characters, photographs, or backgrounds.
-5. Replace only the original textual content, matching the original typography, perspective, and styling as closely as possible.
-6. Keep mathematical equations, symbols, units, and technical notation unchanged unless they contain natural-language text.
-7. If translated text is longer, adjust font size or line wrapping rather than changing the layout.
-8. Preserve page numbers and headings.
-9. Render clear, properly connected, high-quality script for {target_lang}.
-10. Check the final output for untranslated text and ensure non-text elements remain intact.
+3. Keep the original illustration, background, speech bubbles, and layout completely intact.
+4. Replace only the original text, blending seamlessly with the style and lighting.
+5. Render clean, properly connected typography for {target_lang}.
 """
     if glossary.strip():
-        prompt += f"\nGlossary of required terminology:\n{glossary.strip()}"
+        prompt += f"\nGlossary: {glossary.strip()}"
 
-    # Call OpenAI's image edit endpoint
-    # gpt-image-1 / dall-e-2 edits input images according to the prompt
+    prompt = prompt[:990].strip()
+
+    # 2. Call OpenAI DALL-E 2 Image Edit
     response = client.images.edit(
-        image=("page.png", raw_png, "image/png"),
+        model="dall-e-2",
+        image=("page.png", square_bytes, "image/png"),
         prompt=prompt,
         n=1,
         size="1024x1024",
@@ -71,10 +89,13 @@ For this page image:
 
     image_b64 = response.data[0].b64_json
     decoded_bytes = base64.b64decode(image_b64)
-    translated_img = Image.open(io.BytesIO(decoded_bytes)).convert("RGB")
-    
-    # Resize back to original slide aspect ratio and resolution
-    return translated_img.resize(image.size, Image.Resampling.LANCZOS)
+    result_square = Image.open(io.BytesIO(decoded_bytes)).convert("RGB")
+
+    # 3. Crop out the letterbox padding to retrieve pure 16:9
+    result_16_9 = result_square.crop(crop_box)
+
+    # 4. Upscale back to the user's original dimensions
+    return result_16_9.resize(image.size, Image.Resampling.LANCZOS)
 
 
 def compile_images_to_pdf(images: List[Image.Image]) -> bytes:
@@ -112,7 +133,7 @@ with st.sidebar:
         help="Your key stays only in browser session memory and is never logged or stored."
     )
 
-    st.info("💡 **Direct Image Translation**: Uses OpenAI's image model to preserve artwork, characters, and textures seamlessly.")
+    st.info("💡 **16:9 Slide Support**: Automatically pads slides to square, translates, and crops out borders.")
 
     st.divider()
     st.markdown("### 📖 Translation Rules")
@@ -143,7 +164,7 @@ if uploaded_file is not None:
     with col_range1:
         start_page = st.number_input("Start Page", min_value=1, max_value=total_pages, value=1)
     with col_range2:
-        end_page = st.number_input("End Page", min_value=start_page, max_value=total_pages, value=min(start_page + 1, total_pages))
+        end_page = st.number_input("End Page", min_value=start_page, max_value=total_pages, value=min(start_page, total_pages))
 
     if st.button("🚀 Start Translation", type="primary"):
         if not user_api_key:
