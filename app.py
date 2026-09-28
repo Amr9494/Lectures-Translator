@@ -49,6 +49,8 @@ def prepare_square_image(image: Image.Image, target_size: int = 1024) -> Tuple[b
     return byte_stream.getvalue(), crop_box
 
 
+import requests
+
 def translate_page_with_image_model(
     client: OpenAI,
     image: Image.Image,
@@ -63,7 +65,7 @@ def translate_page_with_image_model(
     # 1. Letterbox to square PNG for the API
     square_bytes, crop_box = prepare_square_image(image, target_size=1024)
 
-    # Prompt crafted for image-edit models (kept compact to comply with DALL-E's 1000 char limit)
+    # Prompt crafted for image-edit models (kept compact to comply with DALL-E's character limit)
     prompt = f"""
 For the slide artwork in the center of the image:
 1. Detect all human-readable text.
@@ -77,26 +79,32 @@ For the slide artwork in the center of the image:
 
     prompt = prompt[:990].strip()
 
-    # 2. Call OpenAI DALL-E 2 Image Edit
+    # 2. Call OpenAI DALL-E 2 Image Edit (without response_format)
     response = client.images.edit(
         model="dall-e-2",
         image=("page.png", square_bytes, "image/png"),
         prompt=prompt,
         n=1,
-        size="1024x1024",
-        response_format="b64_json"
+        size="1024x1024"
     )
 
-    image_b64 = response.data[0].b64_json
-    decoded_bytes = base64.b64decode(image_b64)
-    result_square = Image.open(io.BytesIO(decoded_bytes)).convert("RGB")
+    # 3. Retrieve the generated image from URL or b64 fallback
+    image_item = response.data[0]
+    if hasattr(image_item, "url") and image_item.url:
+        img_response = requests.get(image_item.url, timeout=30)
+        img_response.raise_for_status()
+        result_square = Image.open(io.BytesIO(img_response.content)).convert("RGB")
+    elif hasattr(image_item, "b64_json") and image_item.b64_json:
+        decoded_bytes = base64.b64decode(image_item.b64_json)
+        result_square = Image.open(io.BytesIO(decoded_bytes)).convert("RGB")
+    else:
+        raise ValueError("No valid image data or URL returned by OpenAI.")
 
-    # 3. Crop out the letterbox padding to retrieve pure 16:9
+    # 4. Crop out the letterbox padding to retrieve pure 16:9
     result_16_9 = result_square.crop(crop_box)
 
-    # 4. Upscale back to the user's original dimensions
+    # 5. Upscale back to the user's original dimensions
     return result_16_9.resize(image.size, Image.Resampling.LANCZOS)
-
 
 def compile_images_to_pdf(images: List[Image.Image]) -> bytes:
     """Combines a list of PIL Images into a single downloadable PDF file in memory."""
