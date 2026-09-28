@@ -72,7 +72,7 @@ def prepare_for_image_edit(image: Image.Image) -> Image.Image:
 # Structured vision analysis
 # ============================================================
 
-TEXT_SCHEMA = {
+OCR_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
@@ -83,9 +83,6 @@ TEXT_SCHEMA = {
                 "additionalProperties": False,
                 "properties": {
                     "original": {"type": "string"},
-                    "translation": {"type": "string"},
-                    # Normalized coordinates, 0..1000:
-                    # [x1, y1, x2, y2]
                     "bbox": {
                         "type": "array",
                         "items": {"type": "integer"},
@@ -108,13 +105,33 @@ TEXT_SCHEMA = {
                     "keep_original": {"type": "boolean"},
                 },
                 "required": [
-                    "original", "translation", "bbox", "role", "align",
+                    "original", "bbox", "role", "align",
                     "color", "confidence", "keep_original"
                 ],
             },
         }
     },
     "required": ["regions"],
+}
+
+TRANSLATION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "translations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "index": {"type": "integer"},
+                    "translation": {"type": "string"},
+                },
+                "required": ["index", "translation"],
+            },
+        }
+    },
+    "required": ["translations"],
 }
 
 
@@ -133,51 +150,39 @@ def normalize_hex_color(value: str, fallback: str = "#111111") -> str:
     return fallback
 
 
-def analyze_and_translate_page(
+def analyze_page_text(
     client: OpenAI,
     image: Image.Image,
     source_lang: str,
-    target_lang: str,
-    glossary: str,
     min_confidence: float,
 ) -> List[Dict[str, Any]]:
+    """OCR/layout analysis only. No translation is performed here."""
     data_url = pil_to_data_url(image)
-    glossary_text = glossary.strip() if glossary.strip() else "(none)"
 
     prompt = f"""
-You are a precision document-layout OCR and translation engine.
+You are a precision OCR and slide-layout analysis engine.
 
-Analyze the supplied lecture slide image. The goal is to translate ONLY human-readable
-natural-language text while preserving the original artwork, illustrations, diagrams,
-photographs, equations, symbols, numbers, logos, and layout.
+Read the supplied lecture slide in {source_lang}.
 
-Source language: {source_lang}
-Target language: {target_lang}
+Your job is ONLY to identify visible human-readable text and its location.
+DO NOT translate, paraphrase, summarize, interpret, or rewrite the text.
 
-Return every distinct text region that should be translated.
-
-IMPORTANT:
-- Coordinates MUST be normalized integers from 0 to 1000:
-  [x1,y1,x2,y2], where 0,0 is the top-left and 1000,1000 is the bottom-right.
-- Make boxes tight around the visible text, not around surrounding artwork.
-- Do not combine unrelated text regions.
+Rules:
+- Return every distinct text region that is actually visible.
+- Copy the original text exactly as visible.
+- Coordinates MUST be normalized integers 0..1000:
+  [x1,y1,x2,y2], top-left origin.
+- Make boxes tight around the text itself.
+- Do not include surrounding artwork.
 - Do not include decorative marks that are not text.
-- Do not translate equations, mathematical variables, units, numerical values,
-  or programming/code unless they contain natural-language words.
-- If text is already in the target language, set translation equal to original.
-- Preserve proper names unless they are normally translated.
-- Preserve terminology consistently.
-- For text embedded in a diagram, translate the words but do not alter the diagram.
-- For a speech bubble/sign, return only the text inside it.
-- If a region is too uncertain to safely modify, set keep_original=true.
-- Estimate the original text color as a hex RGB value.
-- Confidence is 0 to 1.
-- Never invent text that is not visible.
+- Do not include mathematical symbols/equations unless they contain natural-language words.
+- Keep numerical values and units exactly as text if they are part of a readable label.
+- If text is uncertain, set keep_original=true.
+- Estimate text color as a hex RGB value.
+- confidence is 0..1.
+- Do not invent missing characters.
 
-Glossary:
-{glossary_text}
-
-Return ONLY the requested structured data.
+Return only structured data.
 """
 
     response = client.responses.create(
@@ -192,8 +197,8 @@ Return ONLY the requested structured data.
         text={
             "format": {
                 "type": "json_schema",
-                "name": "slide_translation_regions",
-                "schema": TEXT_SCHEMA,
+                "name": "slide_ocr_regions",
+                "schema": OCR_SCHEMA,
                 "strict": True,
             }
         },
@@ -202,16 +207,13 @@ Return ONLY the requested structured data.
 
     payload = json.loads(response.output_text)
     regions = []
-
     w, h = image.size
 
     for item in payload.get("regions", []):
         bx = item["bbox"]
-
         if len(bx) != 4:
             continue
 
-        # Convert normalized 0..1000 coordinates to actual image pixels.
         x1 = int(round(max(0, min(1000, bx[0])) * w / 1000))
         y1 = int(round(max(0, min(1000, bx[1])) * h / 1000))
         x2 = int(round(max(0, min(1000, bx[2])) * w / 1000))
@@ -226,9 +228,102 @@ Return ONLY the requested structured data.
         item["color"] = normalize_hex_color(item.get("color", "#111111"))
         item["confidence"] = float(item.get("confidence", 0.0))
 
-        regions.append(item)
+        if item["confidence"] >= min_confidence and item["original"].strip():
+            regions.append(item)
 
-    return [r for r in regions if r["confidence"] >= min_confidence]
+    return regions
+
+
+def translate_regions(
+    client: OpenAI,
+    regions: List[Dict[str, Any]],
+    source_lang: str,
+    target_lang: str,
+    glossary: str,
+) -> List[Dict[str, Any]]:
+    """Translate OCR text separately from OCR/layout analysis."""
+    if not regions:
+        return regions
+
+    glossary_text = glossary.strip() if glossary.strip() else "(none)"
+
+    items = "\n".join(
+        f'{i}. ORIGINAL: {json.dumps(r["original"], ensure_ascii=False)}'
+        for i, r in enumerate(regions)
+        if not r.get("keep_original")
+    )
+
+    prompt = f"""
+You are a professional technical translator.
+
+Translate the numbered ORIGINAL strings from {source_lang} to {target_lang}.
+
+This is a text-preservation task, NOT a rewriting task.
+
+STRICT RULES:
+1. Translate only what is written. Do not add explanations, context, or implied words.
+2. Do not paraphrase.
+3. Preserve punctuation, numbers, units, equations, names, and technical symbols.
+4. Preserve the meaning and grammatical force of short phrases.
+5. For short slogans, signs, labels, and speech bubbles, give the natural direct
+   translation, not a sentence that explains the slogan.
+6. Religious/technical terms should not be expanded into an explanation.
+7. If a source word is a loanword or transliteration and the glossary gives a target
+   form, use the glossary exactly.
+8. Do not change "haram" into "religiously forbidden", "legally forbidden",
+   "forbidden by law", or any explanatory phrase unless the source itself says that.
+   When translating to Arabic, "haram" should normally be "حرام".
+9. If the source is already in the target language, return it unchanged.
+10. Return one translation for every numbered item.
+
+Glossary:
+{glossary_text}
+
+Strings:
+{items}
+
+Return only structured data.
+"""
+
+    response = client.responses.create(
+        model=VISION_MODEL,
+        input=[{
+            "role": "user",
+            "content": [{"type": "input_text", "text": prompt}],
+        }],
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "slide_translations",
+                "schema": TRANSLATION_SCHEMA,
+                "strict": True,
+            }
+        },
+        max_output_tokens=8000,
+    )
+
+    payload = json.loads(response.output_text)
+    by_index = {
+        int(x["index"]): x["translation"]
+        for x in payload.get("translations", [])
+    }
+
+    editable_indices = [
+        i for i, r in enumerate(regions)
+        if not r.get("keep_original")
+    ]
+
+    for local_i, region_index in enumerate(editable_indices):
+        regions[region_index]["translation"] = by_index.get(
+            local_i,
+            regions[region_index]["original"],
+        )
+
+    for r in regions:
+        if r.get("keep_original"):
+            r["translation"] = r["original"]
+
+    return regions
 
 
 # ============================================================
@@ -432,6 +527,14 @@ def render_translated_regions(
 
         color = hex_to_rgb(region.get("color", "#111111"))
         align = region.get("align", "left")
+
+        # Arabic should normally be right-to-left. For short bubbles/titles,
+        # center alignment is often more faithful to the source artwork.
+        if "arab" in target_lang.lower():
+            if region.get("role") in {"speech_bubble", "title", "heading"}:
+                align = "center"
+            else:
+                align = "right"
 
         line_height = max(1, int(font.size * 1.15))
         total_h = line_height * len(lines)
@@ -786,13 +889,19 @@ if uploaded is not None:
             )
 
             try:
-                regions = analyze_and_translate_page(
+                regions = analyze_page_text(
                     client=client,
                     image=original,
                     source_lang=source_lang,
+                    min_confidence=confidence,
+                )
+
+                regions = translate_regions(
+                    client=client,
+                    regions=regions,
+                    source_lang=source_lang,
                     target_lang=target_lang,
                     glossary=glossary,
-                    min_confidence=confidence,
                 )
 
                 all_regions[page_num] = regions
@@ -875,6 +984,21 @@ if uploaded is not None:
                     translated_images[0],
                     use_container_width=True,
                 )
+
+        with st.expander(
+            "Detected text + translations (check this before processing the whole lecture)"
+        ):
+            rows = []
+            for page_num, regions in all_regions.items():
+                for region in regions:
+                    rows.append({
+                        "page": page_num + 1,
+                        "original": region["original"],
+                        "translation": region["translation"],
+                        "confidence": round(region["confidence"], 2),
+                    })
+            if rows:
+                st.dataframe(rows, use_container_width=True)
 
         with st.expander(
             "Detected text regions"
